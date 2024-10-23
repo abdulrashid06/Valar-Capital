@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="CompilerConfiguration">
+    <annotationProcessing>
+      <profile name="Maven default annotation processors profile" enabled="true">
+        <sourceOutputDir name="target/generated-sources/annotations" />
+        <sourceTestOutputDir name="target/generated-test-sources/test-annotations" />
+        <outputRelativeToContentRoot value="true" />
+        <module name="SuperTrend_20220330" />
+        <module name="BBStrangle_20240809" />
+        <module name="TriangleBreakout_20220712" />
+        <module name="Bollinger_20240809" />
+        <module name="SuperTrend_20220426" />
+        <module name="BaseStrategy_20220712" />
+        <module name="SuperTrend_20220412" />
+        <module name="SuperTrend_20220419" />
+        <module name="SuperTrend_20220518" />
+        <module name="SuperTrend_20220517" />
+        <module name="SuperTrend_20220406" />
+      </profile>
+    </annotationProcessing>
+  </component>
+</project>
