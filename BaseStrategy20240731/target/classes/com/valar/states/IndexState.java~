@@ -1,0 +1,16 @@
+package com.valar.states;
+
+import com.valar.indicators.ATREntity;
+import com.valar.indicators.EMAEntity;
+
+public class IndexState extends State{
+
+    private double dayEMA,dayATR,lastDayClose;
+    private ATREntity atrEntity;
+    private EMAEntity emaEntity;
+
+    public IndexState(long token, long symphonyToken,String symbol){
+        super(true,token,symphonyToken,"",symbol);
+
+    }
+}
