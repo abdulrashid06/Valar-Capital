@@ -1,0 +1,115 @@
+package com.valar.utils;
+
+import com.valar.accountAttributes.AccountAttributes;
+import com.valar.application.ValarTrade;
+import com.valar.states.State;
+import com.valar.states.StockState;
+import com.valar.entities.TradeEntity;
+
+import java.util.*;
+
+import static com.valar.application.ValarTrade.allAccountAttributes;
+
+public class StrategyInfo {
+    private ValarTrade valarTrade;
+    private Map<String, AccountsLotInfo> accountsLotInfoHashMap = new HashMap<>();
+    public StrategyInfo(ValarTrade valarTrade){
+        this.valarTrade = valarTrade;
+        for (AccountAttributes accountAttributes : allAccountAttributes)
+            accountsLotInfoHashMap.put(accountAttributes.accountName,new AccountsLotInfo(accountAttributes.accountName));
+    }
+
+    public Object[] getUpdatedLots(int indexType,String strategy,String misOrNrml){
+        try {
+            accountsLotInfoHashMap.values().forEach(accountsLotInfo -> accountsLotInfo.reset());
+            Map<String,Map<String,AccountsLotInfo>> serialWiseAccountsLotsMap = new HashMap<>();
+
+            Set<String> symbols = new HashSet<>();
+            Map<String,Set<String>> symbolsMap = new HashMap<>();
+            for (TradeEntity tradeEntity : valarTrade.tradeEntities) {
+                if(indexType==tradeEntity.getKv().indexType) {
+                    for (AccountAttributes accountAttributes : allAccountAttributes) {
+                        if (!tradeEntity.isExited) {
+                            int multiplier = 1;
+                            if (tradeEntity.lOrS == 's') multiplier = -1;
+                            accountsLotInfoHashMap.get(accountAttributes.accountName)
+                                    .update(tradeEntity.indexState, accountAttributes.getQuantAttrib(tradeEntity.getKeyStoreID()).netQuantity, multiplier);
+                            symbols.add(tradeEntity.indexState.getSymbol());
+
+
+                            Map<String,AccountsLotInfo> accountsMap;
+                            if(serialWiseAccountsLotsMap.containsKey(tradeEntity.tag_Sno))accountsMap = serialWiseAccountsLotsMap.get(tradeEntity.tag_Sno);
+                            else {
+                                accountsMap = new HashMap<>();
+                                serialWiseAccountsLotsMap.put(tradeEntity.tag_Sno,accountsMap);
+                            }
+                            if(accountsMap.containsKey(accountAttributes.accountName)){
+                                accountsMap.get(accountAttributes.accountName).update(tradeEntity.indexState, accountAttributes.getQuantAttrib(tradeEntity.getKeyStoreID()).netQuantity, multiplier);
+                            }else{
+                                AccountsLotInfo aaLotsInfo = new AccountsLotInfo(accountAttributes.accountName);
+                                accountsMap.put(accountAttributes.accountName,aaLotsInfo);
+                                aaLotsInfo.update(tradeEntity.indexState, accountAttributes.getQuantAttrib(tradeEntity.getKeyStoreID()).netQuantity, multiplier);
+                            }
+
+                            if(symbolsMap.containsKey(tradeEntity.tag_Sno)){
+                                symbolsMap.get(tradeEntity.tag_Sno).add(tradeEntity.indexState.getSymbol());
+                            }else{
+                                Set<String> set = new HashSet<>();
+                                set.add(tradeEntity.indexState.getSymbol());
+                                symbolsMap.put(tradeEntity.tag_Sno,set);
+                            }
+                        }
+                    }
+                }
+            }
+
+            List<String> updatedLotsList = new ArrayList<>();
+            for(String tag_Sno : serialWiseAccountsLotsMap.keySet()){
+                Map<String,AccountsLotInfo> accountsMap = serialWiseAccountsLotsMap.get(tag_Sno);
+                String lotsInfo = "";
+                Set<String> symbolsList = symbolsMap.get(tag_Sno);
+                for (String symbol : symbolsList) {
+                    lotsInfo += symbol;
+                    for (AccountAttributes accountAttributes : allAccountAttributes) {
+                        int lot = 0;
+                        if(accountsMap.containsKey(accountAttributes.accountName))lot = accountsMap.get(accountAttributes.accountName).lotsMap.get(symbol);
+                        lotsInfo += " " + accountAttributes.accountName + ">" + lot;
+                    }
+                    lotsInfo += ";";
+                }
+                updatedLotsList.add(tag_Sno+":"+lotsInfo+":"+misOrNrml);
+            }
+
+            String lotsInfo = "";
+            for (String symbol : symbols) {
+                lotsInfo += symbol;
+                for (AccountAttributes accountAttributes : allAccountAttributes)
+                    lotsInfo += " " + accountAttributes.accountName + ">" + accountsLotInfoHashMap.get(accountAttributes.accountName).lotsMap.get(symbol);
+                lotsInfo += ";";
+            }
+
+            return new Object[]{strategy+":" + lotsInfo + ":"+misOrNrml,updatedLotsList};
+        }catch (Exception e){e.printStackTrace();}
+
+        return null;
+    }
+
+
+    class AccountsLotInfo{
+        public String accountName;
+        public Map<String,Integer> lotsMap = new HashMap<>();
+        public AccountsLotInfo(String accountName){
+            this.accountName = accountName;
+        }
+
+        public void update(State stockState, int lot, int multiplier){
+            if (lotsMap.containsKey(stockState.getSymbol()))
+                lotsMap.replace(stockState.getSymbol(), lotsMap.get(stockState.getSymbol()) + (lot * multiplier));
+            else lotsMap.put(stockState.getSymbol(), (lot * multiplier));
+        }
+
+        public void reset(){
+            lotsMap.clear();
+        }
+    }
+}
