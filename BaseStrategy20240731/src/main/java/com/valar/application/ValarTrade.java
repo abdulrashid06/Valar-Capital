@@ -1,0 +1,743 @@
+package com.valar.application;
+
+import com.valar.accountAttributes.AccountAttributes;
+import com.valar.accountAttributes.QuantityAttribs;
+import com.valar.accountAttributes.SymphonyAccountAttributes;
+import com.valar.accountAttributes.ZerodhaAccountAttributes;
+//import com.valar.OrderPlacer.SymphonyOrderPlacer;
+import com.valar.indicators.ATREntity;
+import com.valar.indicators.EMAEntity;
+import com.valar.orderPlacer.OrderPlacer;
+import com.valar.entities.*;
+import com.valar.indices.*;
+import com.valar.processors.*;
+//import com.valar.publishers.SaveDataIntoCSV;
+import com.valar.publishers.TickPublisher;
+//import com.valar.processors.OrderProcessor;
+//import com.valar.subscribers.PrintSubscriber;
+import com.valar.states.IndexState;
+import com.valar.states.State;
+import com.valar.states.StockState;
+import com.valar.utils.*;
+import com.zerodhatech.kiteconnect.KiteConnect;
+import com.zerodhatech.kiteconnect.kitehttp.exceptions.KiteException;
+import com.zerodhatech.models.Tick;
+
+import java.io.*;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.StandardOpenOption;
+import java.text.SimpleDateFormat;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.LocalTime;
+import java.util.*;
+import java.util.concurrent.*;
+
+import static java.util.Map.entry;
+
+public class ValarTrade{
+    public List<Strategy> strategies = new ArrayList();
+    public KiteConnect kiteConnect;
+    public ArrayList<Long> tokens;
+    public static PrintInfo printInfo;
+    public static String strategy = "DeltaHedging",api;
+
+    public static final Object lock = new Object(),
+            orderPlacerLock = new Object();
+    public static volatile Map<Integer,Index> indexMap = new TreeMap<>(){{
+        put(0,new BankNifty());
+        put(1,new Nifty());
+        put(2,new FinNifty());
+        put(3,new Bankex());
+        put(4,new Sensex());
+    }};
+
+    public static Path errorPath,optionsPath, masterInfoPath, profitInfoPath,apilogPath;
+    public static Path lotsInfoPath,masterLotsInfoPath,strategyInfoPath,rejectedOrdersInfoPath;
+
+    public static long vixToken = 264969;
+
+    public volatile List<TradeEntity> tradeEntities = new ArrayList<>();
+
+    public static Map<Integer,Integer> quantityFreezeMap = new HashMap<>();
+    private StrategyInfo strategyInfo;
+    public BOD bod;
+    public String lotFile;
+    public static List<AccountAttributes> allAccountAttributes = new ArrayList();
+
+    public Map<Integer,Integer> indexDayMap;
+
+    public ScheduledThreadPoolExecutor scheduler = new ScheduledThreadPoolExecutor(5); //Schedule
+    public ExecutorService executorService = new ThreadPoolExecutor(10, // core size
+            500, // max size
+            10*60, // idle timeout
+            TimeUnit.SECONDS,
+            new ArrayBlockingQueue<Runnable>(1000));
+
+    public static LimitRange limitRange = new LimitRange();
+
+    public static void main(String[] args) throws Exception, KiteException {
+
+        ValarTrade valarTrade = new ValarTrade();
+        valarTrade.bod = new BOD(valarTrade);
+        System.gc();
+
+
+        String ln;
+
+        List<String> expiryLines = Files.readAllLines(Paths.get(".\\DaysToExpiry.csv"));
+
+        if(Boolean.parseBoolean(expiryLines.get(0).split(",")[0])) {
+            String dayOfWeek = LocalDate.now().getDayOfWeek().toString();
+            int day = -1;
+            if (dayOfWeek.equals("THURSDAY")) {
+                day = 0;
+            } else if (dayOfWeek.equals("WEDNESDAY")) {
+                day = 1;
+            } else if (dayOfWeek.equals("TUESDAY")) {
+                day = 2;
+            } else if (dayOfWeek.equals("MONDAY")) {
+                day = 3;
+            } else if (dayOfWeek.equals("FRIDAY")) {
+                day = 4;
+            }
+            valarTrade.indexDayMap = Map.ofEntries(
+                    entry(0, day),
+                    entry(1 ,day),
+                    entry(2 ,day),
+                    entry(3 ,day),
+                    entry(4 ,day)
+            );
+        }else{
+            valarTrade.indexDayMap = Map.ofEntries(
+                    entry(0, Integer.parseInt(expiryLines.get(1).split(",")[1])),
+                    entry(1 ,Integer.parseInt(expiryLines.get(2).split(",")[1])),
+                    entry(2 ,Integer.parseInt(expiryLines.get(3).split(",")[1])),
+                    entry(3 ,Integer.parseInt(expiryLines.get(4).split(",")[1])),
+                    entry(4 ,Integer.parseInt(expiryLines.get(5).split(",")[1]))
+            );
+        }
+
+
+        List<String> accountLines = Files.readAllLines(Paths.get(KeyStoreFiles.accounts.getFile()));
+        String[] brokersSplits = accountLines.get(1).split(",");
+        String[] accountSplits = accountLines.get(0).split(","),
+                loginCredSplits = accountLines.get(2).split(",");
+
+        String valarApiLine = null;
+        for(int i = 5;i < accountLines.size();i++){
+            ln = accountLines.get(i);
+            String strategyApi = ln.split(",")[0];
+            if (strategyApi.equalsIgnoreCase(ValarTrade.strategy)){
+                valarApiLine = ln;
+                break;
+            }
+        }
+
+        ValarTrade.api = valarApiLine.split(",")[1].toLowerCase();
+        AccountAttributes valarAccountAttribute = new ZerodhaAccountAttributes(valarTrade.lotFile,"z","Valar",0);
+        String[] valarLoginCreds = valarApiLine.split(",")[2].split(":");
+        valarAccountAttribute.API_KEY = valarLoginCreds[0];
+        valarAccountAttribute.API_SECRET = valarLoginCreds[1];
+        allAccountAttributes.add(valarAccountAttribute);
+
+        for(int i = 0;i < brokersSplits.length;i++){
+            String broker = brokersSplits[i];
+            AccountAttributes accountAttributes;
+            if(broker.equalsIgnoreCase("z"))accountAttributes = new ZerodhaAccountAttributes(valarTrade.lotFile,broker,accountSplits[i], i+1);
+            else accountAttributes = new SymphonyAccountAttributes(valarTrade.lotFile,broker,accountSplits[i], i+1);
+            allAccountAttributes.add(accountAttributes);
+
+            AccountAttributes aa = allAccountAttributes.get(i+1);
+            if (aa.broker.equalsIgnoreCase("z")) {
+                String[] apiAttribs = loginCredSplits[i].split(":");
+                aa.API_KEY = apiAttribs[0];
+                aa.API_SECRET = apiAttribs[1];
+            } else aa.clientID = loginCredSplits[i];
+        }
+
+        List<String> lines = Files.readAllLines(Paths.get(".\\QuantityFreezeLimits.csv"));
+        for(String qfl : lines){
+            String[] spilts = qfl.split(",");
+            int type = 0;
+            if(spilts[0].equalsIgnoreCase("BANKNIFTY"))type = 0;
+            else if(spilts[0].equalsIgnoreCase("NIFTY"))type = 1;
+            else if(spilts[0].equalsIgnoreCase("FINNIFTY"))type = 2;
+            else if(spilts[0].equalsIgnoreCase("BANKEX"))type = 3;
+            else if(spilts[0].equalsIgnoreCase("SENSEX"))type = 4;
+            quantityFreezeMap.put(type,Integer.parseInt(spilts[1]));
+        }
+
+
+        valarTrade.strategyInfo = new StrategyInfo(valarTrade);
+        List<String> symphonyLoginCredentialsLines = Files.readAllLines(Paths.get(".\\SymphonyLoginAccess.csv"));
+        Map<String, SymphonyLoginCredentialsLoader> symphonyLoginCredentialsLoaderMap = new HashMap<>();
+        if(symphonyLoginCredentialsLines.size()!=0){
+            int totalSymphonyAccounts = symphonyLoginCredentialsLines.get(0).split(",").length;
+            for(int i=0;i<totalSymphonyAccounts;i++){
+                SymphonyLoginCredentialsLoader slcl = new SymphonyLoginCredentialsLoader(symphonyLoginCredentialsLines,i);
+                symphonyLoginCredentialsLoaderMap.put(slcl.getAccountName(),slcl);
+            }
+        }
+
+        AuthUtils authUtils = new AuthUtils();
+        valarTrade.loadQuantityAttribs(-1,true,-1);
+
+        for(AccountAttributes accountAttributes:allAccountAttributes){
+            if(accountAttributes.broker.equalsIgnoreCase("z")) {
+                authUtils.loadZerodhaToken((ZerodhaAccountAttributes) accountAttributes);
+                accountAttributes.kiteConnect = authUtils.getKiteConnect((ZerodhaAccountAttributes) accountAttributes);
+            }else{
+                SymphonyAccountAttributes aa = (SymphonyAccountAttributes)accountAttributes;
+                SymphonyLoginCredentialsLoader slcl = symphonyLoginCredentialsLoaderMap.get(aa.accountName);
+                aa.setLoginCredentials(slcl);
+                aa.interactiveToken = authUtils.getSymphonyToken(".\\"+slcl.tokenFile,slcl.url,slcl.secretKey,slcl.appKey);;
+            }
+        }
+
+        BufferedReader br = new BufferedReader((new FileReader(KeyStoreFiles.keyStore.getFile())));
+        br.readLine();
+
+        HashMap<Long, StockState> optionStockStates;
+        Set<Integer> keystoreAvailableForIndexes = new HashSet<>();
+        while((ln=br.readLine())!=null){
+            KeyValues kv = new KeyValues(ln);
+            if(valarTrade.indexDayMap.get(kv.indexType)==kv.day){
+                optionStockStates = indexMap.get(kv.indexType).stockStates;
+                keystoreAvailableForIndexes.add(kv.indexType);
+
+                Strategy strategy = new Strategy(valarTrade,kv,null, optionStockStates);
+                valarTrade.strategies.add(strategy);
+                Index index = indexMap.get(kv.indexType);
+                index.keystorePresent = true;
+                index.addIndicators(kv);
+            }
+        }
+
+        valarTrade.kiteConnect = allAccountAttributes.get(0).kiteConnect;
+        valarTrade.tokens = new ArrayList();
+
+        Timer timer = new Timer();
+        long delay = (60 - LocalDateTime.now().getSecond()) * 1000;
+        long intevalPeriod = 60 * 1000;
+        TimerTask task = new TimerTask() {
+            @Override
+            public void run() {
+                synchronized (orderPlacerLock) {
+                    valarTrade.checkPerMin();
+                }
+            }
+        };
+        timer.scheduleAtFixedRate(task, delay, intevalPeriod);
+
+        Timer lotsInfoTimer = new Timer();
+        delay = (65 - LocalDateTime.now().getSecond()) * 1000;
+        intevalPeriod = 20 * 1000;
+        task = new TimerTask() {
+            @Override
+            public void run() {
+                valarTrade.printLotsInfo();
+            }
+        };
+        lotsInfoTimer.scheduleAtFixedRate(task, delay, intevalPeriod);
+
+
+        intevalPeriod = 60 * 1000;
+        timer = new Timer();
+        delay = (90 - LocalDateTime.now().getSecond()) * 1000;
+        TimerTask task2 = new TimerTask() {
+            @Override
+            public void run() {
+                valarTrade.checkTokenUpdationEvery30Seconds();
+            }
+        };
+        timer.scheduleAtFixedRate(task2, delay, intevalPeriod);
+
+        String date = LocalDateTime.now().toString().replace(":","-"),time = LocalDateTime.now().getHour()+"-"+LocalDateTime.now().getMinute();
+        valarTrade.errorPath = Paths.get("./logbooks/"+strategy+"_Error["+date+"]_["+time+"].csv");
+        String orderInfoOptionsFilePath = "./logbooks/"+strategy+"_Logbook["+date+"]_["+time+"].csv";
+
+        String[] files = BOD.getFilesOrDirectories(".\\logbooks/");
+        String masterFile = "";
+        for(String file:files) {
+            if (file.contains("LogbookMaster")) {
+                masterFile = file;
+                break;
+            }
+        }
+        if(masterFile.isEmpty()){
+            masterFile = "LogbookMaster["+date+"]["+time+"].csv";
+            valarTrade.masterInfoPath = Paths.get(".\\logbooks/"+masterFile);
+            valarTrade.printMasterHeading();
+        }else valarTrade.masterInfoPath = Paths.get(".\\logbooks/"+masterFile);
+
+        valarTrade.optionsPath = Paths.get(orderInfoOptionsFilePath);
+        valarTrade.profitInfoPath = Paths.get(".\\logbooks\\"+strategy+"_ProfitInfo["+date+"]_["+time+"].csv");
+        valarTrade.lotsInfoPath = Paths.get(".\\logbooks\\lotsInfo.csv");
+        masterLotsInfoPath = Paths.get(".\\logbooks\\MasterLotsInfo.csv");
+        valarTrade.strategyInfoPath = Paths.get(".\\logbooks\\StrategyInfo.csv");
+        valarTrade.rejectedOrdersInfoPath = Paths.get(".\\logbooks\\Rejected Orders.csv");
+
+        apilogPath = Paths.get(".\\logbooks\\"+ strategy+"_APILog[" + date +"]_[" + time + "].csv");
+        printAPILogHeading();
+
+        valarTrade.printInfo = new PrintInfo(valarTrade,valarTrade.optionsPath);
+
+        try (BufferedWriter writer = Files.newBufferedWriter(valarTrade.profitInfoPath, StandardOpenOption.CREATE,
+                StandardOpenOption.APPEND)) {
+            writer.write("Time,Entries,Exits,Profit%");
+            writer.newLine();
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+
+        for(Index index : indexMap.values()){
+            if(index.keystorePresent) {
+                valarTrade.loadInstruments(index.getInstrumentFile(), index.stockStates);
+            }
+        }
+
+        if(valarTrade.bod.isTesting())
+            for(int i=0;i<1000;i++) {
+                for (int j = 0; j < 1000; j++)
+                    System.out.print("Testing ");
+                System.out.println();
+            }
+
+        System.out.println("Waiting");
+        while(valarTrade.getInSeconds(LocalDateTime.now().getHour(),LocalDateTime.now().getMinute(),LocalDateTime.now().getSecond())
+                < valarTrade.getInSeconds(9,14,20)){}
+        System.out.println("Started");
+
+        //Initialize services
+        TickPublisher tickPublisher = new TickPublisher();
+        valarTrade.createPipeLineForOptions(tickPublisher);
+
+        valarTrade.createPipelineForIndexAndAddTokens(tickPublisher);
+        tickPublisher.streamTicks(valarTrade.kiteConnect, valarTrade.tokens);
+
+        SLChecker slChecker = new SLChecker(valarTrade.strategies);
+        slChecker.start();
+    }
+
+    private void printMasterHeading(){
+//        String heading = strategy+","+pa.ksId+","+pa.tradeId+","+pa.time+","+symbol+","+pa.transactionType+","+pa.reason+","+closesInfo+","+tag;
+        String heading = "strategy,sno,TradeId,Date,Time,Option,TransactionType,reason,Close,EventTriggerPrice,OrderPrice,Tag";
+        try(BufferedWriter writer = Files.newBufferedWriter(ValarTrade.masterInfoPath, StandardOpenOption.CREATE,
+                StandardOpenOption.APPEND)){
+            writer.write(heading);
+            writer.newLine();
+
+        }catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    private void loadInstruments(String instrumentsFile,HashMap<Long, StockState> stockStatesMap)throws Exception{
+        FileReader fileReader = new FileReader(instrumentsFile);
+        String s;
+        BufferedReader reader = new BufferedReader(fileReader);
+        try{
+            while((s=reader.readLine())!=null){
+//                System.out.println(s);
+                String symbol = s.split(",")[2];
+                long token = Long.parseLong(s.split(",")[0]),
+                        symphonyToken = Long.parseLong(s.split(",")[1]);
+                tokens.add(token);
+                stockStatesMap.put(token,new StockState(false,token,symphonyToken,s.split(",")[3],symbol));
+            }
+        }catch(Exception e){e.printStackTrace();}
+    }
+
+    private void createPipelineForIndexAndAddTokens(Flow.Publisher<Tick> tickPublisher){
+        indexMap.values().stream().filter(index -> index.keystorePresent).forEach(index -> {
+            //For Index
+            Object[] res = index.getTick2MinAndTickState(this),
+                    futureRes = index.getTick2MinAndTickStateFuture(this);
+            TickToMinuteProcessor tick2MinuteProcessor = (TickToMinuteProcessor)res[0];
+            TickStateProcessor tickStateProcessor = (TickStateProcessor)res[1];
+            IndicatorsProcessor indicatorsProcessor = new IndicatorsProcessor(index.minSeriesMap,index.indicatorUpdatedForPeriodMap);
+            tick2MinuteProcessor.subscribe(indicatorsProcessor);
+
+            tickPublisher.subscribe(tickStateProcessor);
+            tickStateProcessor.subscribe(tick2MinuteProcessor);
+
+            //For IndexFuture
+            TickToMinuteProcessor tick2MinuteProcessorFuture = (TickToMinuteProcessor)futureRes[0];
+            TickStateProcessor tickStateProcessorFuture = (TickStateProcessor)futureRes[1];
+            tickPublisher.subscribe(tickStateProcessorFuture);
+            tickStateProcessorFuture.subscribe(tick2MinuteProcessorFuture);
+
+            //add symbols
+            tokens.add(index.token);
+            tokens.add(index.futureState.getToken());
+        });
+    /*
+                             --> print
+                            |
+        tick -> vwap -> ema -> decision -> order
+     */
+
+    }
+
+    private void createPipeLineForOptions(Flow.Publisher<Tick> tickPublisher){
+        for(Index index : indexMap.values()){
+            if(index.keystorePresent) {
+                for (StockState ss : index.stockStates.values()) {
+                    TickToMinuteProcessorOptions tick2MinuteProcessor = new TickToMinuteProcessorOptions(ss.getToken(), ss);
+                    tickPublisher.subscribe(tick2MinuteProcessor);
+                    /*IndicatorsProcessor indicatorsProcessor = new IndicatorsProcessor(ss);
+                    tick2MinuteProcessor.subscribe(indicatorsProcessor);
+                    DecisionProcessor decisionProcessor = new DecisionProcessor(this,ss);
+                    indicatorsProcessor.subscribe(decisionProcessor);*/
+                }
+            }
+        }
+    }
+
+    /*private void createPipeLineForVix(Flow.Publisher<Tick> tickPublisher, Long token){
+        TickToMinuteProcessor tickToMinuteProcessor = new TickToMinuteProcessor(this,null,token,3);
+        TickStateProcessor tickStateProcessor = new TickStateProcessor(token);
+        tickPublisher.subscribe(tickStateProcessor);
+        tickStateProcessor.subscribe(tickToMinuteProcessor);
+    }*/
+
+    public static void printAPILogHeading(){
+        try(BufferedWriter writer = Files.newBufferedWriter(apilogPath, StandardOpenOption.CREATE,
+                StandardOpenOption.APPEND)){
+            writer.write("Time,TimeStamp,Account,Action,AppOrderId,Tag,Option,Buy/Sell,LTP,LimitPrice,Quantity");
+            writer.newLine();
+
+        }catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    public synchronized static void addAPILog(ApiInfo apiInfo){
+        try(BufferedWriter writer = Files.newBufferedWriter(apilogPath, StandardOpenOption.CREATE,
+                StandardOpenOption.APPEND)){
+            writer.write(LocalTime.now()+","+apiInfo);
+            writer.newLine();
+
+        }catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    private void updatePremiums(){
+        for(Index index: indexMap.values()){
+            double indexClose = index.stockState.getClose();
+            for(StockState ss: index.stockStates.values()){
+                ss.updatePremium(indexClose);
+            }
+        }
+    }
+
+    private void fetchDBMargin(){
+
+    }
+
+    public void checkPerMin(){
+        int mins = getCurrentTimeInMinutes();
+
+        updatePremiums();
+        fetchDBMargin();
+        strategies.stream().filter(strategy->!strategy.dayExited).forEach(strategy -> strategy.checkCondition(mins));
+        scheduler.schedule(()->executorService.submit(()->{
+            indexMap.values().stream().filter(index->index.keystorePresent).forEach(index->{
+                Map<Integer,Boolean> indicatorUpdatedForPeriodMap = index.indicatorUpdatedForPeriodMap;
+                for(int candlePeriod : indicatorUpdatedForPeriodMap.keySet()){
+                    index.indicatorUpdatedForPeriodMap.put(candlePeriod,false);
+                }
+            });
+        }),3,TimeUnit.SECONDS);
+
+        List<String> reqStringSplits = new ArrayList<>();
+        String strategy2InfoToPrint = "";
+        for(Strategy strategy : strategies){
+            String appendInfo = "";
+            int netQuantity = 0,quantity = 0;
+            try{
+                QuantityAttribs qa = allAccountAttributes.get(1).getQuantAttrib(strategy.kv.sno);
+                netQuantity = qa.netQuantity;
+                quantity = qa.quantity;
+            }catch (Exception e){}
+
+            for(TradeEntity tradeEntity:strategy.tradeEntities){
+                String reqProfiString = tradeEntity.getProfit(true)+"";
+
+                appendInfo += strategy.kv.label+ ":" + strategy.tag_Sno+":"+strategy.kv.tag+":"+tradeEntity.maxOverlap+":"+netQuantity+":"+quantity+":"+KeyStoreFiles.keyStore.getFile()
+                        +":"+strategy.kv.sno+":"+strategy.kv.indexType+":"+strategy.kv.day+":"+reqProfiString.replaceAll(",",":")+":"+tradeEntity.dayExitReason+";";
+                String[] splits = reqProfiString.split(",");
+                for(int i = 0;i < splits.length;i++){
+                    if(reqStringSplits.size()==i){
+                        reqStringSplits.add(splits[i]);
+                    }else reqStringSplits.set(i,reqStringSplits.get(i)+","+splits[i]);
+                }
+            }
+            if(appendInfo.isEmpty())appendInfo = strategy.kv.label+ ":" + strategy.tag_Sno+":"+strategy.kv.tag+"_:"+2+":"+netQuantity+":"+quantity+":"+KeyStoreFiles.keyStore.getFile()
+                    +":"+strategy.kv.sno+":"+strategy.kv.indexType+":"+strategy.kv.day+"::::::;";
+            strategy2InfoToPrint += appendInfo;
+        }
+
+        String profitString = LocalTime.now()+"";
+        for(String s : reqStringSplits){
+            profitString += ":"+s;
+        }
+
+        try (BufferedWriter writer = Files.newBufferedWriter(profitInfoPath, StandardOpenOption.CREATE,
+                StandardOpenOption.APPEND)) {
+            writer.write(profitString);
+            writer.newLine();
+        } catch (Exception e) {e.printStackTrace();}
+
+
+        try (BufferedWriter writer = Files.newBufferedWriter(strategyInfoPath, StandardOpenOption.CREATE,
+                StandardOpenOption.APPEND)) {
+            writer.write(LocalTime.now() + "|" + strategy + "|" + strategy2InfoToPrint);
+            writer.newLine();
+        } catch (IOException e) {e.printStackTrace();}
+    }
+
+    private void printLotsInfo(){
+        indexMap.values().forEach(index -> {
+            Object[] obj = strategyInfo.getUpdatedLots(index.type,index.strategy,"NRML");
+            if(obj!=null) {
+                try (BufferedWriter writer = Files.newBufferedWriter(lotsInfoPath, StandardOpenOption.CREATE,
+                        StandardOpenOption.APPEND)) {
+                    writer.write(LocalTime.now() + "," + obj[0] + "\n");
+                } catch (IOException e) {e.printStackTrace();}
+
+                List<String> updatedLotsList = (List<String>) obj[1];
+                String common = LocalTime.now() + ",";
+                for (String lisw : updatedLotsList) {
+                    try (BufferedWriter writer = Files.newBufferedWriter(masterLotsInfoPath, StandardOpenOption.CREATE,
+                            StandardOpenOption.APPEND)) {
+                        writer.write(common + lisw);
+                        writer.newLine();
+                    } catch (IOException e) {e.printStackTrace();}
+                }
+            }
+        });
+    }
+
+    public Map<AccountAttributes,Map<Integer,Integer>> getAccountLotsMap(){
+        Map<AccountAttributes,Map<Integer,Integer>> accountLotAndSplitMap = new ConcurrentHashMap<>();
+        try{
+            BufferedReader lotBr = new BufferedReader(new FileReader(lotFile));
+            lotBr.readLine();
+            String lots;
+
+
+            while((lots=lotBr.readLine())!=null){
+
+                String[] lotsSplits = lots.split(",");
+
+                int sno = Integer.parseInt(lotsSplits[0]);
+
+                for(int j=1;j<lotsSplits.length;j++){
+                    int lot = Integer.parseInt(lotsSplits[j]);
+                    AccountAttributes aa = allAccountAttributes.get(j-1);
+                    if(!accountLotAndSplitMap.containsKey(aa)){
+                        Map<Integer,Integer> lotMap = new HashMap<>();
+                        lotMap.put(sno,lot);
+                        accountLotAndSplitMap.put(aa,lotMap);
+                    }else {
+                        accountLotAndSplitMap.get(aa).put(sno, lot);
+                    }
+                }
+            }
+
+        }catch (Exception e){e.printStackTrace();}
+        return accountLotAndSplitMap;
+    }
+
+    private void loadQuantityAttribs(int indexType,boolean set,int sno){
+        Map<AccountAttributes,Map<Integer,Integer>> accountLotAndSplitMap = getAccountLotsMap();
+
+        String lotsMultiplierValues = "";
+        if(indexMap.containsKey(indexType)){
+            List<String> lotsMultiplierLines = new ArrayList<>();
+            try{lotsMultiplierLines = Files.readAllLines(Paths.get("LotsMultiplier.csv"));}catch (Exception e){e.printStackTrace();}
+            for(String line : lotsMultiplierLines){
+                String[] splits = line.split(",");
+                String strategyName = splits[0];
+                if(indexMap.get(indexType).strategy.equalsIgnoreCase(strategyName)){
+                    lotsMultiplierValues = line;
+                    break;
+                }
+            }
+        }
+
+        boolean isLotsMultiplierEmpty = lotsMultiplierValues.isEmpty();
+        if(isLotsMultiplierEmpty && !set) return;
+
+        for(AccountAttributes aa:accountLotAndSplitMap.keySet()){
+            Map<Integer,Integer> lotAndSplitMap = accountLotAndSplitMap.get(aa);
+            if(set)aa.setQuantityAttribsMap(isLotsMultiplierEmpty,lotAndSplitMap,lotsMultiplierValues);
+            else aa.reloadQuantities(lotAndSplitMap,sno,lotsMultiplierValues);
+        }
+    }
+
+    public static void printError(String error){
+        try (BufferedWriter writer = Files.newBufferedWriter(errorPath, StandardOpenOption.CREATE,
+                StandardOpenOption.APPEND)) {
+            writer.write(LocalTime.now()+","+error);
+            writer.newLine();
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    private void checkTokenUpdationEvery30Seconds(){
+        try {
+            limitRange.update();
+
+            List<String> symphonyLoginCredentialsLines = Files.readAllLines(Paths.get(".\\SymphonyLoginAccess.csv"));
+            for (AccountAttributes aa : allAccountAttributes) {
+                if (!aa.broker.equalsIgnoreCase("z")){
+                    ((SymphonyAccountAttributes) aa).checkTokenAndUrlUpdation(symphonyLoginCredentialsLines);
+                }else {
+                    try {
+                        List<String> lines = Files.readAllLines(Paths.get(((ZerodhaAccountAttributes)aa).accessTokenPath));
+                        if (lines != null && lines.size() > 0) {
+                            LocalDate localDate = LocalDate.parse(lines.get(0));
+                            String token = lines.get(1);
+                            if (localDate.equals(LocalDate.now()) &&
+                                    !aa.kiteConnect.getAccessToken().equals(token)) {
+                                aa.kiteConnect.setAccessToken(token);
+                            }
+                        }
+                    }catch (Exception e){}
+                }
+            }
+        }catch (Exception e){e.printStackTrace();}
+    }
+
+    public static double getSD(List<Double> bnCloseList) {
+        if(bnCloseList.size()==0)return 0;
+
+        double standardDeviation = 0,mean,res,sq;
+        double sum = bnCloseList.stream()
+                .mapToDouble(a -> a)
+                .sum();
+
+        mean = sum / bnCloseList.size();
+
+        for(double i:bnCloseList)
+            standardDeviation = (float)(standardDeviation + Math.pow((i - mean), 2));
+
+        sq = standardDeviation / bnCloseList.size();
+        res = (float)Math.sqrt(sq);
+
+//        System.out.println(arr.size()+" "+arr+" \tSD "+res);
+
+        return res;
+    }
+
+    public void checkQuantityEvery30Seconds(int indexType,int sno,List<OrderPlacer> orderPlacers,List<TradeEntity> tradeEntities){
+        synchronized (orderPlacerLock) {
+            loadQuantityAttribs(indexType, false, sno);
+            if (tradeEntities.size() == 0) {
+                for (OrderPlacer orderPlacer : orderPlacers) {
+                    AccountAttributes accountAttributes = allAccountAttributes.get(orderPlacer.id);
+                    if (accountAttributes.getQuantAttrib(sno).checkForChangeInQuantity()) {
+                        accountAttributes.getQuantAttrib(sno).setDiffAsQuantity();
+                        orderPlacer.updateQuantityAttribs(0, false, null, true);
+                    }
+                }
+
+                return;
+            }
+            List<OrderPlacer> updatedAccountAttribsOPs = new ArrayList<>();
+            List<Integer> updatedBy = new ArrayList();
+
+            for (OrderPlacer orderPlacer : orderPlacers) {
+                AccountAttributes accountAttributes = allAccountAttributes.get(orderPlacer.id);
+                if (accountAttributes.getQuantAttrib(sno).checkForChangeInQuantity()) {
+                    updatedAccountAttribsOPs.add(orderPlacer);
+                    updatedBy.add(accountAttributes.getQuantAttrib(sno).getUpdatedQuantity());
+                }
+            }
+
+            if (updatedAccountAttribsOPs.size() != 0) {
+                tradeEntities.parallelStream().forEach(tradeEntity -> {
+                    if (tradeEntity.isExited) return;
+                    tradeEntity.addTag();
+                    updateQuantityOfTradeEntity(tradeEntity, updatedAccountAttribsOPs, updatedBy, sno);
+                });
+            }
+        }
+    }
+
+    private void updateQuantityOfTradeEntity(TradeEntity tradeEntity,List<OrderPlacer> updatedAccountAttribsOPs,
+                                             List<Integer> updatedBy,int sno){
+
+        updatedAccountAttribsOPs.parallelStream().forEach((op) -> {
+            int diff = updatedBy.get(updatedAccountAttribsOPs.indexOf(op));
+            boolean isEntry = diff > 0;
+            op.scheduleLimitOrdersSplits(tradeEntity.getKv().indexType,tradeEntity.getIds(),tradeEntity.lOrS,false, tradeEntity, tradeEntity.indexState,isEntry,true);
+        });
+
+        Map<Integer, Integer> soldQuantitiesUpdationMap = new HashMap(),
+                boughtQuantitiesUpdationMap = new HashMap();
+        for (OrderPlacer op : updatedAccountAttribsOPs) {
+            AccountAttributes aa = allAccountAttributes.get(op.id);
+            if (aa.getQuantAttrib(sno).getDiff() > 0) soldQuantitiesUpdationMap.put(op.id, aa.getQuantAttrib(sno).getAbsoluteDifference());
+            else boughtQuantitiesUpdationMap.put(op.id, aa.getQuantAttrib(sno).getAbsoluteDifference());
+        }
+        printUpdation(soldQuantitiesUpdationMap, "Entry",tradeEntity);
+        printUpdation(boughtQuantitiesUpdationMap, "Exit",tradeEntity);
+    }
+
+    private void printUpdation(Map<Integer,Integer> updationMap,String entryOrExit,TradeEntity tradeEntity){
+        StringBuilder quantities = new StringBuilder();
+        boolean isEntry = entryOrExit.equalsIgnoreCase("entry");
+        boolean soldOrBoughtInAnyAccount = false;
+        for(int i=0;i<allAccountAttributes.size();i++){
+            if(updationMap.containsKey(i)){
+                quantities.append(updationMap.get(i)+",");
+                soldOrBoughtInAnyAccount = true;
+            }else{
+                quantities.append("0,");
+            }
+        }
+        if(!soldOrBoughtInAnyAccount)return;
+
+        State ss = tradeEntity.indexState;
+        String tag = ss.getQUTag(tradeEntity.getTagKey()),
+                time = LocalTime.now().toString(),
+                info = ",QuantityUpdation -> ,"+tradeEntity.getIds()+","+time+","+ss.getSymbol()+","
+                        +entryOrExit+",,"+ss.getClosesInfo()+","+ss.getPremium()+","+tradeEntity.getTotalProfit()+","+quantities+tag;
+        printInfo.print(info);
+        PrintAttribs pa = new PrintAttribs(tradeEntity.getKeyStoreID(),tradeEntity.getTradeId(),tradeEntity,isEntry,tradeEntity.lOrS);
+        pa.time = time;
+        ss.printMasterInfo(pa,tag);
+    }
+
+    public BOD getBod(){
+        return bod;
+    }
+
+    public static int getInSeconds(int hr, int min,int sec) {
+        return hr*3600 + min*60 + sec;
+    }
+
+    public static int getInMinutes(int hr , int min){
+        return hr*60+min;
+    }
+
+    public static int getInMinutes(String time){
+        String[] splits = time.split(":");
+        int hr = Integer.parseInt(splits[0]),min = Integer.parseInt(splits[1]);
+        return hr*60+min;
+    }
+
+    public static int getCurrentTimeInMinutes(){
+        LocalTime lt = LocalTime.now();
+        int hr = lt.getHour(),min = lt.getMinute();
+        return hr*60+min;
+    }
+}

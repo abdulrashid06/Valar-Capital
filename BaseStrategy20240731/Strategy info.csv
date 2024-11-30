@@ -1,0 +1,12 @@
+ValarTrade :
+	Loads DaysToExpiry
+	Loads AccountsFile and takes token a/c to strategy
+	Loads AccountAttributes,QuantityFreezeLimits
+	Does login in accounts if not already logged in by checking date on the token file
+	Loads keystore and the instruments based upon the index provided by the keystore
+	Based upon the keystores we'll have Strategy object for every keystore provided
+	We'll mark keystorePresent for that particular index for which keystore is present
+	And then based on this keystorePresent var, we'll load instruments and create pipeline
+	We'll set Timer for every one minute, to check strategy entries/exits
+	Based on the very first account(which belongs to Zerodha), we'll create socket
+	Then finally we'll create pipeline after subscribing the tokens for the instruments required for the day

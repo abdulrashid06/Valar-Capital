@@ -1,0 +1,10 @@
+<component name="ArtifactManager">
+  <artifact type="jar" name="SuperTrend_20220518:jar">
+    <output-path>$PROJECT_DIR$/out/artifacts/SuperTrend_20220518_jar</output-path>
+    <root id="archive" name="SuperTrend_20220518.jar">
+      <element id="module-output" name="SuperTrend_20220518" />
+      <element id="extracted-dir" path="$MAVEN_REPOSITORY$/org/ta4j/ta4j-core/0.14/ta4j-core-0.14.jar" path-in-jar="/" />
+      <element id="extracted-dir" path="$MAVEN_REPOSITORY$/org/slf4j/slf4j-api/1.7.25/slf4j-api-1.7.25.jar" path-in-jar="/" />
+    </root>
+  </artifact>
+</component>
